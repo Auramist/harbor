@@ -1,13 +1,26 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { useRatingPoster } from "@/lib/ratings/poster";
 import { createPortal } from "react-dom";
-import { Eye, Loader2, Search, X } from "lucide-react";
+import {
+  ArrowDownWideNarrow,
+  ArrowUpDown,
+  ArrowUpNarrowWide,
+  Eye,
+  Loader2,
+  Search,
+  X,
+} from "lucide-react";
 import { Poster } from "@/components/poster";
 import { RatingStars } from "@/components/ratings/rating-stars";
 import { useT } from "@/lib/i18n";
 import { fetchUserRatings } from "@/lib/social/ratings-api";
 import type { PublicRating, RatingCounts } from "@/lib/ratings/types";
 import { timeAgo } from "@/views/profile/profile-bits";
+import {
+  nextRatingSort,
+  sortUserRatings,
+  type RatingSort,
+} from "./user-ratings-sort";
 
 const TABS: Array<{ id: string; label: string; countKey: keyof RatingCounts }> = [
   { id: "all", label: "All", countKey: "total" },
@@ -18,6 +31,7 @@ const TABS: Array<{ id: string; label: string; countKey: keyof RatingCounts }> =
 ];
 
 const EMPTY_COUNTS: RatingCounts = { movie: 0, series: 0, anime: 0, manga: 0, total: 0 };
+const VISIBLE_BATCH_SIZE = 50;
 
 export function UserRatings({
   handle,
@@ -33,13 +47,18 @@ export function UserRatings({
   const t = useT();
   const [type, setType] = useState("all");
   const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<RatingSort>("off");
   const deferredQuery = useDeferredValue(query);
   const [items, setItems] = useState<PublicRating[]>([]);
   const [counts, setCounts] = useState<RatingCounts>(EMPTY_COUNTS);
   const [cursor, setCursor] = useState<string | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const [more, setMore] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(VISIBLE_BATCH_SIZE);
   const seen = useRef(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const requestVersion = useRef(0);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -54,61 +73,90 @@ export function UserRatings({
 
   const trimmedQuery = deferredQuery.trim();
   const normalizedQuery = trimmedQuery.toLowerCase();
-  const visibleItems = useMemo(
-    () =>
-      normalizedQuery
-        ? items.filter((r) => r.title.toLowerCase().includes(normalizedQuery))
-        : items,
-    [items, normalizedQuery],
-  );
+  const needsCompleteRatings = sort !== "off";
+  const visibleItems = useMemo(() => {
+    const matchingItems = normalizedQuery
+      ? items.filter((r) => r.title.toLowerCase().includes(normalizedQuery))
+      : items;
+    return sortUserRatings(matchingItems, sort);
+  }, [items, normalizedQuery, sort]);
+  const displayedItems = visibleItems.slice(0, visibleCount);
+  const hasBufferedItems = visibleCount < visibleItems.length;
 
   useEffect(() => {
     const ac = new AbortController();
+    const version = ++requestVersion.current;
     setLoading(true);
+    setMore(false);
+    setVisibleCount(VISIBLE_BATCH_SIZE);
     setItems([]);
-    let countsFromFirstPage: RatingCounts | undefined;
 
-    const fetchPages = async () => {
-      let nextCursor: string | undefined = undefined;
+    const fetchRatings = async () => {
+      let nextCursor: string | undefined;
       const loaded: PublicRating[] = [];
+      let firstCounts: RatingCounts | undefined;
 
       do {
-        const page = await fetchUserRatings(handle, {
-          type,
-          cursor: nextCursor,
-          query: trimmedQuery || undefined,
-        }, ac.signal);
-        if (ac.signal.aborted) return;
-        if (!countsFromFirstPage) countsFromFirstPage = page.counts;
+        const page = await fetchUserRatings(
+          handle,
+          { type, cursor: nextCursor, query: trimmedQuery || undefined },
+          ac.signal,
+        );
+        if (ac.signal.aborted || version !== requestVersion.current) return;
+        firstCounts ??= page.counts;
         loaded.push(...page.items);
         nextCursor = page.nextCursor;
-      } while (trimmedQuery && nextCursor);
+      } while (needsCompleteRatings && nextCursor);
 
-      if (ac.signal.aborted) return;
+      if (ac.signal.aborted || version !== requestVersion.current) return;
       setItems(loaded);
-      setCursor(trimmedQuery ? undefined : nextCursor);
-      if (!seen.current || type === "all") setCounts(countsFromFirstPage ?? EMPTY_COUNTS);
+      setCursor(needsCompleteRatings ? undefined : nextCursor);
+      if (!seen.current || type === "all") setCounts(firstCounts ?? EMPTY_COUNTS);
       seen.current = true;
       setLoading(false);
     };
 
-    fetchPages().catch(() => {
-      if (!ac.signal.aborted) setLoading(false);
+    fetchRatings().catch(() => {
+      if (!ac.signal.aborted && version === requestVersion.current) {
+        setLoading(false);
+      }
     });
 
     return () => ac.abort();
-  }, [handle, type, trimmedQuery]);
+  }, [handle, type, trimmedQuery, needsCompleteRatings]);
 
   const loadMore = useCallback(() => {
-    if (trimmedQuery || !cursor || more) return;
+    if (hasBufferedItems) {
+      setVisibleCount((current) => current + VISIBLE_BATCH_SIZE);
+      return;
+    }
+    if (!cursor || more) return;
+    const version = requestVersion.current;
     setMore(true);
-    fetchUserRatings(handle, { type, cursor, query: undefined })
+    fetchUserRatings(handle, { type, cursor, query: trimmedQuery || undefined })
       .then((page) => {
+        if (version !== requestVersion.current) return;
         setItems((prev) => [...prev, ...page.items]);
         setCursor(page.nextCursor);
       })
-      .finally(() => setMore(false));
-  }, [cursor, more, handle, type, trimmedQuery]);
+      .catch(() => {})
+      .finally(() => {
+        if (version === requestVersion.current) setMore(false);
+      });
+  }, [cursor, more, handle, type, trimmedQuery, hasBufferedItems]);
+
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel || (!hasBufferedItems && !cursor) || more) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMore();
+      },
+      { root: scrollRef.current, rootMargin: "500px 0px" },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [cursor, more, hasBufferedItems, loadMore]);
 
   return createPortal(
     <div
@@ -136,15 +184,49 @@ export function UserRatings({
         </header>
 
         <div className="space-y-3 border-b border-edge-soft px-7 py-3">
-          <div className="relative max-w-[420px]">
-            <Search size={14} className="pointer-events-none absolute start-3.5 top-1/2 -translate-y-1/2 text-ink-subtle" />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder={t("Search ratings")}
-              aria-label={t("Search ratings")}
-              className="h-10 w-full rounded-full border border-edge-soft bg-surface/90 ps-11 pe-4 text-[13px] text-ink placeholder:text-ink-subtle outline-none transition-colors focus:border-edge"
-            />
+          <div className="flex max-w-[468px] items-center gap-2">
+            <div className="relative min-w-0 flex-1">
+              <Search size={14} className="pointer-events-none absolute start-3.5 top-1/2 -translate-y-1/2 text-ink-subtle" />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder={t("Search ratings")}
+                aria-label={t("Search ratings")}
+                className="h-10 w-full rounded-full border border-edge-soft bg-surface/90 ps-11 pe-4 text-[13px] text-ink placeholder:text-ink-subtle outline-none transition-colors focus:border-edge"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => setSort((current) => nextRatingSort(current))}
+              title={
+                sort === "off"
+                  ? t("Sort ratings")
+                  : sort === "highest"
+                    ? t("Highest to lowest")
+                    : t("Lowest to highest")
+              }
+              aria-label={
+                sort === "off"
+                  ? t("Sort ratings: off")
+                  : sort === "highest"
+                    ? t("Sort ratings: highest to lowest")
+                    : t("Sort ratings: lowest to highest")
+              }
+              aria-pressed={sort !== "off"}
+              className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full border transition-colors ${
+                sort === "off"
+                  ? "border-edge-soft text-ink-muted hover:bg-elevated hover:text-ink"
+                  : "border-accent/40 bg-accent/10 text-accent hover:bg-accent/15"
+              }`}
+            >
+              {sort === "highest" ? (
+                <ArrowDownWideNarrow size={16} strokeWidth={2.2} />
+              ) : sort === "lowest" ? (
+                <ArrowUpNarrowWide size={16} strokeWidth={2.2} />
+              ) : (
+                <ArrowUpDown size={16} strokeWidth={2.2} />
+              )}
+            </button>
           </div>
           <div className="flex flex-wrap gap-1.5">
             {TABS.map((tab) => {
@@ -168,7 +250,7 @@ export function UserRatings({
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto px-7 py-6">
+        <div ref={scrollRef} className="flex-1 overflow-y-auto px-7 py-6">
           {loading ? (
             <div className="flex h-40 items-center justify-center">
               <Loader2 size={22} className="animate-spin text-ink-subtle" />
@@ -179,19 +261,17 @@ export function UserRatings({
             </div>
           ) : (
             <div className="flex flex-col gap-3">
-              {visibleItems.map((r) => (
+              {displayedItems.map((r) => (
                 <RatingRow key={r.itemKey} r={r} onOpenMeta={onOpenMeta} />
               ))}
-              {!trimmedQuery && cursor && (
-                <button
-                  type="button"
-                  onClick={loadMore}
-                  disabled={more}
-                  className="mx-auto mt-2 inline-flex items-center gap-2 rounded-full border border-edge px-5 py-2 text-[13px] font-medium text-ink-muted transition-colors hover:bg-elevated hover:text-ink disabled:opacity-50"
+              {(hasBufferedItems || cursor) && (
+                <div
+                  ref={sentinelRef}
+                  aria-hidden
+                  className="flex h-12 items-center justify-center"
                 >
-                  {more && <Loader2 size={14} className="animate-spin" />}
-                  {t("Load more")}
-                </button>
+                  {more && <Loader2 size={16} className="animate-spin text-ink-subtle" />}
+                </div>
               )}
             </div>
           )}
