@@ -56,9 +56,8 @@ export function UserRatings({
   const [more, setMore] = useState(false);
   const [visibleCount, setVisibleCount] = useState(VISIBLE_BATCH_SIZE);
   const seen = useRef(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const sentinelRef = useRef<HTMLDivElement>(null);
   const requestVersion = useRef(0);
+  const loadingMore = useRef(false);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -88,6 +87,7 @@ export function UserRatings({
     const version = ++requestVersion.current;
     setLoading(true);
     setMore(false);
+    loadingMore.current = false;
     setVisibleCount(VISIBLE_BATCH_SIZE);
     setItems([]);
 
@@ -127,11 +127,14 @@ export function UserRatings({
 
   const loadMore = useCallback(() => {
     if (hasBufferedItems) {
-      setVisibleCount((current) => current + VISIBLE_BATCH_SIZE);
+      setVisibleCount((current) =>
+        Math.min(current + VISIBLE_BATCH_SIZE, visibleItems.length),
+      );
       return;
     }
-    if (!cursor || more) return;
+    if (!cursor || loadingMore.current) return;
     const version = requestVersion.current;
+    loadingMore.current = true;
     setMore(true);
     fetchUserRatings(handle, { type, cursor, query: trimmedQuery || undefined })
       .then((page) => {
@@ -141,22 +144,12 @@ export function UserRatings({
       })
       .catch(() => {})
       .finally(() => {
-        if (version === requestVersion.current) setMore(false);
+        if (version === requestVersion.current) {
+          loadingMore.current = false;
+          setMore(false);
+        }
       });
-  }, [cursor, more, handle, type, trimmedQuery, hasBufferedItems]);
-
-  useEffect(() => {
-    const sentinel = sentinelRef.current;
-    if (!sentinel || (!hasBufferedItems && !cursor) || more) return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) loadMore();
-      },
-      { root: scrollRef.current, rootMargin: "500px 0px" },
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [cursor, more, hasBufferedItems, loadMore]);
+  }, [cursor, handle, type, trimmedQuery, hasBufferedItems, visibleItems.length]);
 
   return createPortal(
     <div
@@ -250,7 +243,15 @@ export function UserRatings({
           </div>
         </div>
 
-        <div ref={scrollRef} className="flex-1 overflow-y-auto px-7 py-6">
+        <div
+          className="flex-1 overflow-y-auto px-7 py-6"
+          onScroll={(event) => {
+            const scroller = event.currentTarget;
+            const distanceFromBottom =
+              scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+            if (distanceFromBottom <= 500) loadMore();
+          }}
+        >
           {loading ? (
             <div className="flex h-40 items-center justify-center">
               <Loader2 size={22} className="animate-spin text-ink-subtle" />
@@ -266,7 +267,6 @@ export function UserRatings({
               ))}
               {(hasBufferedItems || cursor) && (
                 <div
-                  ref={sentinelRef}
                   aria-hidden
                   className="flex h-12 items-center justify-center"
                 >
